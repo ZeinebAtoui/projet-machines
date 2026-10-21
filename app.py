@@ -1898,3 +1898,792 @@ else:
         
         
     )
+
+
+
+# ============================================================
+# MODULE 7 — EXPLAINABLE AI (XAI)
+# ============================================================
+
+import re
+import numpy as np
+import pandas as pd
+import streamlit as st
+import matplotlib.pyplot as plt
+
+from sklearn.metrics import roc_auc_score
+
+st.header("7. Explainable AI (XAI)")
+
+# ------------------------------------------------------------
+# 1. Vérification des données
+# ------------------------------------------------------------
+
+cles_requises = [
+    "X_train_resampled",
+    "y_train_resampled",
+    "X_test",
+    "y_test",
+]
+
+if not all(cle in st.session_state for cle in cles_requises):
+    st.warning(
+        "Prépare les données dans le Module 2, puis entraîne "
+        "les modèles avant d'utiliser le Module 7."
+    )
+    st.stop()
+
+X_train_xai = pd.DataFrame(
+    st.session_state["X_train_resampled"]
+).copy().reset_index(drop=True)
+
+y_train_xai = pd.Series(
+    st.session_state["y_train_resampled"]
+).reset_index(drop=True)
+
+X_test_xai = pd.DataFrame(
+    st.session_state["X_test"]
+).copy().reset_index(drop=True)
+
+y_test_xai = pd.Series(
+    st.session_state["y_test"]
+).reset_index(drop=True)
+
+# ------------------------------------------------------------
+# 2. Récupération des modèles
+# Vérifier que les clés correspondent à celles des modules 3 à 5
+# ------------------------------------------------------------
+
+cles_modeles = {
+    "XGBoost": "xgb_model",
+    "Random Forest": "rf_model",
+    "Régression logistique": "lr_model",
+    "Arbre de décision": "dt_model",
+    "KNN": "knn_model",
+}
+
+modeles_xai = {}
+
+for nom, cle in cles_modeles.items():
+    modele = st.session_state.get(cle)
+    if modele is not None:
+        modeles_xai[nom] = modele
+
+if not modeles_xai:
+    st.warning(
+        "Aucun modèle entraîné trouvé. "
+        "Entraîne un modèle avant de continuer."
+    )
+    st.stop()
+
+nom_modele_xai = st.selectbox(
+    "Choisir le modèle à expliquer",
+    list(modeles_xai.keys()),
+    key="xai_modele_selectionne",
+)
+
+modele_xai = modeles_xai[nom_modele_xai]
+
+# ------------------------------------------------------------
+# 3. Nettoyage identique à celui du Module 3 (XGBoost)
+# Ne pas modifier le code d'entraînement
+# ------------------------------------------------------------
+
+def nettoyer_noms_colonnes(columns):
+    noms = []
+
+    for col in columns:
+        nom = str(col)
+        nom = re.sub(r"[\[\]<]", "_", nom)
+        nom = re.sub(r"[^A-Za-z0-9_]", "_", nom)
+        noms.append(nom)
+
+    noms_uniques = []
+    deja_vus = {}
+
+    for nom in noms:
+        if nom in deja_vus:
+            deja_vus[nom] += 1
+            nom = f"{nom}_{deja_vus[nom]}"
+        else:
+            deja_vus[nom] = 0
+
+        noms_uniques.append(nom)
+
+    return noms_uniques
+
+
+X_train_modele = X_train_xai.copy()
+X_test_modele = X_test_xai.copy()
+
+if nom_modele_xai == "XGBoost":
+    # Même transformation que pendant l'entraînement
+    X_train_modele.columns = nettoyer_noms_colonnes(
+        X_train_modele.columns
+    )
+    X_test_modele.columns = nettoyer_noms_colonnes(
+        X_test_modele.columns
+    )
+
+    # Les noms enregistrés dans le modèle sont la référence.
+    # On vérifie les colonnes avant de les réordonner.
+    if hasattr(modele_xai, "feature_names_in_"):
+        colonnes_modele = list(modele_xai.feature_names_in_)
+
+        if (
+            len(colonnes_modele) != len(X_test_modele.columns)
+            or set(colonnes_modele) != set(X_test_modele.columns)
+        ):
+            st.error(
+                "Les colonnes XGBoost ne correspondent toujours pas. "
+                "Colonnes attendues : "
+                + str(colonnes_modele)
+                + " | Colonnes obtenues : "
+                + str(list(X_test_modele.columns))
+            )
+            st.stop()
+
+        X_test_modele = X_test_modele[colonnes_modele].copy()
+        X_train_modele = X_train_modele[colonnes_modele].copy()
+
+    else:
+        # Avec certaines versions de XGBoost, les noms ne sont pas
+        # exposés par feature_names_in_. L'ordre doit donc être celui
+        # du jeu de données utilisé pendant l'entraînement.
+        if len(X_train_modele.columns) != len(X_test_modele.columns):
+            st.error(
+                "Le nombre de colonnes d'entraînement et de test "
+                "ne correspond pas pour XGBoost."
+            )
+            st.stop()
+
+else:
+    # Les autres modèles conservent leurs colonnes d'origine.
+    if list(X_train_modele.columns) != list(X_test_modele.columns):
+        st.error(
+            "Les colonnes d'entraînement et de test ne correspondent "
+            "pas pour " + nom_modele_xai + "."
+        )
+        st.stop()
+
+features_xai = list(X_test_modele.columns)
+
+# ------------------------------------------------------------
+# 4. Regroupement des variables catégorielles
+# ------------------------------------------------------------
+
+groupes_variables_xai = {}
+
+colonnes_type = [
+    col for col in features_xai
+    if col == "Type" or col.startswith("Type_")
+]
+
+if colonnes_type:
+    groupes_variables_xai["Type"] = colonnes_type
+
+for col in features_xai:
+    if col not in colonnes_type:
+        groupes_variables_xai[col] = [col]
+
+
+# ------------------------------------------------------------
+# 5. Fonction de prédiction
+# ------------------------------------------------------------
+
+def probabilite_positive(nom_modele, modele, X):
+    X_pred = X.copy()
+
+    if nom_modele == "XGBoost":
+        # Les données sont déjà nettoyées et ordonnées.
+        # Ne pas appliquer une deuxième transformation ici.
+        pass
+
+    if hasattr(modele, "predict_proba"):
+        proba = np.asarray(modele.predict_proba(X_pred))
+
+        if proba.ndim == 2 and proba.shape[1] >= 2:
+            return proba[:, 1]
+
+        return proba[:, 0] if proba.ndim == 2 else proba
+
+    if hasattr(modele, "decision_function"):
+        scores = np.asarray(modele.decision_function(X_pred))
+        return 1 / (1 + np.exp(-np.clip(scores, -500, 500)))
+
+    return np.asarray(modele.predict(X_pred), dtype=float)
+
+
+# ------------------------------------------------------------
+# 6. Importance native
+# ------------------------------------------------------------
+
+st.subheader("Importance native")
+
+if hasattr(modele_xai, "feature_importances_"):
+    valeurs = np.asarray(modele_xai.feature_importances_)
+
+    if len(valeurs) == len(features_xai):
+        lignes = []
+
+        for variable, colonnes in groupes_variables_xai.items():
+            indices = [
+                features_xai.index(col)
+                for col in colonnes
+            ]
+
+            lignes.append({
+                "Variable": variable,
+                "Importance": float(valeurs[indices].sum()),
+            })
+
+        importance_df = pd.DataFrame(lignes).sort_values(
+            "Importance", ascending=False
+        )
+
+        st.dataframe(
+            importance_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        fig, ax = plt.subplots(figsize=(9, 5))
+        affiche = importance_df.sort_values("Importance")
+        ax.barh(affiche["Variable"], affiche["Importance"])
+        ax.set_xlabel("Importance")
+        ax.set_title("Importance native regroupée")
+        fig.tight_layout()
+        st.pyplot(fig)
+        plt.close(fig)
+
+elif hasattr(modele_xai, "coef_"):
+    coefficients = np.asarray(modele_xai.coef_)
+
+    if coefficients.ndim == 2:
+        importance = np.mean(np.abs(coefficients), axis=0)
+        coefficients_nets = np.mean(coefficients, axis=0)
+    else:
+        importance = np.abs(coefficients)
+        coefficients_nets = coefficients
+
+    if len(importance) == len(features_xai):
+        lignes = []
+
+        for variable, colonnes in groupes_variables_xai.items():
+            indices = [
+                features_xai.index(col)
+                for col in colonnes
+            ]
+
+            lignes.append({
+                "Variable": variable,
+                "Importance": float(importance[indices].sum()),
+                "Coefficient net": float(coefficients_nets[indices].sum()),
+            })
+
+        importance_df = pd.DataFrame(lignes).sort_values(
+            "Importance", ascending=False
+        )
+
+        st.dataframe(
+            importance_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+else:
+    st.info(
+        "Ce modèle ne fournit pas d'importance native. "
+        "Utilise la permutation importance ou SHAP."
+    )
+
+
+# ------------------------------------------------------------
+# 7. Permutation importance regroupée
+# ------------------------------------------------------------
+
+st.subheader("Permutation importance")
+
+if len(X_test_modele) < 2:
+    st.warning("Le jeu de test doit contenir au moins deux observations.")
+
+elif st.button(
+    "Calculer la permutation importance",
+    key="calculer_permutation_xai",
+):
+    try:
+        rng = np.random.RandomState(42)
+        n_perm = min(300, len(X_test_modele))
+
+        indices = rng.choice(
+            len(X_test_modele),
+            size=n_perm,
+            replace=False,
+        )
+
+        X_perm = X_test_modele.iloc[indices].copy().reset_index(drop=True)
+        y_perm = y_test_xai.iloc[indices].reset_index(drop=True)
+
+        score_base = roc_auc_score(
+            y_perm,
+            probabilite_positive(nom_modele_xai, modele_xai, X_perm),
+        )
+
+        lignes = []
+
+        for variable, colonnes in groupes_variables_xai.items():
+            scores = []
+
+            for _ in range(5):
+                X_melange = X_perm.copy()
+                ordre = rng.permutation(len(X_melange))
+
+                X_melange.loc[:, colonnes] = (
+                    X_perm.iloc[ordre][colonnes].to_numpy()
+                )
+
+                score = roc_auc_score(
+                    y_perm,
+                    probabilite_positive(
+                        nom_modele_xai,
+                        modele_xai,
+                        X_melange,
+                    ),
+                )
+
+                scores.append(score)
+
+            differences = score_base - np.asarray(scores)
+
+            lignes.append({
+                "Variable": variable,
+                "Importance moyenne": float(differences.mean()),
+                "Écart-type": float(differences.std()),
+            })
+
+        permutation_df = pd.DataFrame(lignes).sort_values(
+            "Importance moyenne", ascending=False
+        )
+
+        st.session_state["xai_permutation_result"] = (
+            nom_modele_xai,
+            permutation_df,
+        )
+
+    except Exception as e:
+        st.error(f"Erreur permutation importance : {e}")
+
+resultat_perm = st.session_state.get("xai_permutation_result")
+
+if resultat_perm is not None and resultat_perm[0] == nom_modele_xai:
+    permutation_df = resultat_perm[1]
+
+    st.dataframe(
+        permutation_df,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    affiche = permutation_df.sort_values("Importance moyenne")
+    ax.barh(
+        affiche["Variable"],
+        affiche["Importance moyenne"],
+        xerr=affiche["Écart-type"],
+        capsize=3,
+    )
+    ax.axvline(0, linewidth=1)
+    ax.set_xlabel("Diminution du ROC-AUC")
+    ax.set_title("Permutation importance regroupée")
+    fig.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+
+
+# ------------------------------------------------------------
+# 8. SHAP regroupé
+# ------------------------------------------------------------
+
+st.subheader("SHAP")
+
+def creer_explication_groupee(explication, X_source, groupes):
+    import shap
+
+    valeurs = np.asarray(explication.values)
+
+    if valeurs.ndim == 3:
+        valeurs = valeurs[:, :, -1]
+
+    if valeurs.ndim != 2:
+        raise ValueError(f"Dimensions SHAP non prises en charge : {valeurs.shape}")
+
+    noms_features = list(X_source.columns)
+    noms_groupes = list(groupes.keys())
+
+    valeurs_groupees = []
+
+    for variable in noms_groupes:
+        indices = [
+            noms_features.index(col)
+            for col in groupes[variable]
+            if col in noms_features
+        ]
+
+        valeurs_groupees.append(
+            valeurs[:, indices].sum(axis=1)
+        )
+
+    valeurs_groupees = np.column_stack(valeurs_groupees)
+
+    donnees_groupees = []
+
+    for variable in noms_groupes:
+        colonnes = groupes[variable]
+
+        if variable == "Type" and all(
+            col.startswith("Type_") for col in colonnes
+        ):
+            matrice = X_source[colonnes].to_numpy(dtype=float)
+            codes = np.argmax(matrice, axis=1).astype(float)
+            codes[np.all(matrice == 0, axis=1)] = -1
+            donnees_groupees.append(codes)
+
+        elif len(colonnes) == 1:
+            donnees_groupees.append(
+                pd.to_numeric(
+                    X_source[colonnes[0]],
+                    errors="coerce",
+                ).to_numpy()
+            )
+
+        else:
+            donnees_groupees.append(
+                X_source[colonnes].mean(axis=1).to_numpy()
+            )
+
+    donnees_groupees = np.column_stack(donnees_groupees)
+
+    base = np.asarray(explication.base_values)
+
+    if base.ndim == 0:
+        base = np.repeat(base, len(X_source))
+    elif base.ndim > 1:
+        base = base.reshape(len(X_source), -1)[:, -1]
+
+    return shap.Explanation(
+        values=valeurs_groupees,
+        base_values=base,
+        data=donnees_groupees,
+        feature_names=noms_groupes,
+    )
+
+
+if st.button("Calculer les explications SHAP", key="calculer_shap_xai"):
+    try:
+        import shap
+
+        X_background = X_train_modele.sample(
+            n=min(50, len(X_train_modele)),
+            random_state=42,
+        ).reset_index(drop=True)
+
+        X_expliquer = X_test_modele.sample(
+            n=min(100, len(X_test_modele)),
+            random_state=42,
+        ).reset_index(drop=True)
+
+        def fonction_prediction(data):
+            df = pd.DataFrame(data, columns=features_xai)
+            return probabilite_positive(nom_modele_xai, modele_xai, df)
+
+        explainer = shap.Explainer(
+            fonction_prediction,
+            X_background,
+            feature_names=features_xai,
+        )
+
+        explication_brute = explainer(X_expliquer)
+
+        explication_groupee = creer_explication_groupee(
+            explication_brute,
+            X_expliquer,
+            groupes_variables_xai,
+        )
+
+        st.session_state["xai_shap_result"] = (
+            nom_modele_xai,
+            explication_groupee,
+        )
+
+    except Exception as e:
+        st.error(f"Erreur SHAP : {e}")
+
+resultat_shap = st.session_state.get("xai_shap_result")
+
+if resultat_shap is not None and resultat_shap[0] == nom_modele_xai:
+    try:
+        import shap
+
+        explication = resultat_shap[1]
+        valeurs = np.asarray(explication.values)
+
+        st.markdown("#### Importance globale SHAP")
+
+        shap.plots.beeswarm(
+            explication,
+            max_display=len(groupes_variables_xai),
+            show=False,
+        )
+        st.pyplot(plt.gcf())
+        plt.close("all")
+
+        importance_shap = pd.DataFrame({
+            "Variable": list(explication.feature_names),
+            "Importance SHAP moyenne": np.mean(np.abs(valeurs), axis=0),
+        }).sort_values("Importance SHAP moyenne", ascending=False)
+
+        st.dataframe(
+            importance_shap,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.markdown("#### Explication locale")
+
+        index_local = st.selectbox(
+            "Choisir une observation",
+            options=list(range(len(valeurs))),
+            format_func=lambda i: f"Observation {i}",
+            key="xai_index_local",
+        )
+
+        shap.plots.waterfall(
+            explication[index_local],
+            max_display=len(groupes_variables_xai),
+            show=False,
+        )
+        st.pyplot(plt.gcf())
+        plt.close("all")
+
+        contributions = pd.DataFrame({
+            "Variable": list(explication.feature_names),
+            "Contribution SHAP": valeurs[index_local],
+        })
+
+        contributions["Valeur absolue"] = contributions[
+            "Contribution SHAP"
+        ].abs()
+
+        contributions = contributions.sort_values(
+            "Valeur absolue", ascending=False
+        )
+
+        st.dataframe(
+            contributions.drop(columns="Valeur absolue"),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        positives = contributions[
+            contributions["Contribution SHAP"] > 0
+        ]["Variable"].tolist()
+
+        negatives = contributions[
+            contributions["Contribution SHAP"] < 0
+        ]["Variable"].tolist()
+
+        if positives:
+            st.write(
+                "Variables augmentant la sortie expliquée : "
+                + ", ".join(positives[:3])
+            )
+
+        if negatives:
+            st.write(
+                "Variables diminuant la sortie expliquée : "
+                + ", ".join(negatives[:3])
+            )
+
+        st.caption(
+            "Le signe indique l'effet sur la sortie expliquée par SHAP, "
+            "pas une relation causale."
+        )
+
+    except Exception as e:
+        st.error(f"Erreur affichage SHAP : {e}")
+
+
+# ------------------------------------------------------------
+# 9. LIME — explication locale
+# ------------------------------------------------------------
+st.subheader("LIME — Explication locale")
+
+st.write(
+    """
+    LIME explique une prédiction isolée en apprenant un modèle
+    linéaire local autour de l'observation sélectionnée.
+    Les contributions sont exprimées dans l'échelle de la
+    probabilité de défaillance.
+    """
+)
+
+# Le résultat LIME est réinitialisé lorsque le modèle change.
+if st.session_state.get("lime_modele_courant") != nom_modele_xai:
+    st.session_state["lime_modele_courant"] = nom_modele_xai
+    st.session_state.pop("xai_lime_result", None)
+
+index_local_lime = st.selectbox(
+    "Choisir l'observation à expliquer",
+    options=list(range(len(X_test_modele))),
+    format_func=lambda i: f"Observation {i}",
+    key="lime_index_local",
+)
+
+if st.button("Calculer l'explication LIME", key="calculer_lime_xai"):
+    try:
+        from lime.lime_tabular import LimeTabularExplainer
+
+        classes_xai = list(modele_xai.classes_)
+        index_positif_xai = classes_xai.index(1)
+
+        def fonction_prediction_lime(data):
+            dataframe = pd.DataFrame(data, columns=features_xai)
+
+            proba = np.asarray(
+                modele_xai.predict_proba(dataframe)
+            )[:, index_positif_xai]
+
+            return np.column_stack([1 - proba, proba])
+
+        explainer_lime = LimeTabularExplainer(
+            training_data=X_train_modele.to_numpy(dtype=float),
+            feature_names=features_xai,
+            class_names=["Aucune défaillance", "Défaillance"],
+            mode="classification",
+            discretize_continuous=False,
+            random_state=42,
+        )
+
+        explication_lime = explainer_lime.explain_instance(
+            data_row=X_test_modele.iloc[index_local_lime].to_numpy(
+                dtype=float
+            ),
+            predict_fn=fonction_prediction_lime,
+            num_features=len(features_xai),
+            num_samples=5000,
+            top_labels=1,
+        )
+
+        st.session_state["xai_lime_result"] = (
+            nom_modele_xai,
+            index_local_lime,
+            explication_lime,
+        )
+
+    except Exception as e:
+        st.error(f"Erreur pendant le calcul LIME : {e}")
+
+
+resultat_lime = st.session_state.get("xai_lime_result")
+
+if resultat_lime is not None and resultat_lime[0] == nom_modele_xai:
+    try:
+        index_conserve_lime = resultat_lime[1]
+        explication_lime = resultat_lime[2]
+        label_explique = explication_lime.top_labels[0]
+
+        observation = X_test_modele.iloc[[index_conserve_lime]]
+
+        proba_observee = float(
+            probabilite_positive(
+                nom_modele_xai,
+                modele_xai,
+                observation,
+            )[0]
+        )
+
+        st.markdown(
+            f"#### Observation {index_conserve_lime} expliquée par LIME"
+        )
+
+        col1, col2 = st.columns(2)
+        col1.metric("Défaillance prédite", f"{proba_observee:.2%}")
+        col2.metric(
+            "Qualité de l'approximation (R²)",
+            (
+                f"{explication_lime.score:.3f}"
+                if explication_lime.score is not None
+                else "Non disponible"
+            ),
+        )
+
+        contributions_lime = pd.DataFrame(
+            explication_lime.as_list(label=label_explique),
+            columns=["Variable", "Contribution LIME"],
+        )
+
+        contributions_lime["Valeur absolue"] = contributions_lime[
+            "Contribution LIME"
+        ].abs()
+
+        contributions_lime = contributions_lime.sort_values(
+            "Valeur absolue",
+            ascending=False,
+        )
+
+        fig, ax = plt.subplots(figsize=(9, 5))
+
+        affiche_lime = contributions_lime.sort_values("Contribution LIME")
+        couleurs_lime = [
+            "#c0392b" if valeur < 0 else "#27ae60"
+            for valeur in affiche_lime["Contribution LIME"]
+        ]
+
+        ax.barh(
+            affiche_lime["Variable"],
+            affiche_lime["Contribution LIME"],
+            color=couleurs_lime,
+        )
+        ax.axvline(0, linewidth=1)
+        ax.set_xlabel("Contribution à la probabilité de défaillance")
+        ax.set_title("Explication LIME de l'observation")
+        fig.tight_layout()
+        st.pyplot(fig)
+        plt.close(fig)
+
+        st.dataframe(
+            contributions_lime.drop(columns="Valeur absolue"),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        augmentent = contributions_lime[
+            contributions_lime["Contribution LIME"] > 0
+        ]["Variable"].tolist()
+
+        diminuent = contributions_lime[
+            contributions_lime["Contribution LIME"] < 0
+        ]["Variable"].tolist()
+
+        st.markdown("#### Interprétation automatique")
+
+        if augmentent:
+            st.write(
+                "Variables qui augmentent la probabilité de défaillance : "
+                + ", ".join(augmentent[:3])
+            )
+
+        if diminuent:
+            st.write(
+                "Variables qui diminuent la probabilité de défaillance : "
+                + ", ".join(diminuent[:3])
+            )
+
+        st.caption(
+            "LIME approxime localement le modèle par un modèle linéaire. "
+            "Les contributions portent sur la probabilité de défaillance "
+            "et ne prouvent pas une relation causale."
+        )
+
+    except Exception as e:
+        st.error(f"Erreur pendant l'affichage de l'explication LIME : {e}")
