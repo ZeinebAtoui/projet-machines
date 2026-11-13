@@ -1,6 +1,6 @@
-# Maintenance prédictive — AI4I 2020
+# Maintenance prédictive 
 
-Application Streamlit pour explorer les données, préparer les variables et comparer des modèles de prédiction des pannes.
+
 
 ## Installation
 
@@ -28,6 +28,3 @@ streamlit run app.py
 
 Dans l'application, importer le fichier CSV AI4I 2020 via le bouton de téléversement.
 
-## Dataset
-
-L'application demande le CSV via son interface : aucun chemin Kaggle n'est nécessaire dans `app.py`.
